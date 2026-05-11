@@ -1,0 +1,17 @@
+# 排除所有数据集文件
+*.txt
+*.csv
+data/
+
+# 排除 Python 运行产生的缓存
+__pycache__/
+*.py[cod]
+
+# 排除模型权重文件（非常大）
+*.pth
+*.bin
+*.pt
+
+# 排除系统自动生成的文件
+.DS_Store
+Thumbs.db
