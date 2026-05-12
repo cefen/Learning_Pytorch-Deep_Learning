@@ -1,5 +1,6 @@
 # 排除所有数据集文件
 *.txt
+data/*.txt
 *.csv
 data/
 
