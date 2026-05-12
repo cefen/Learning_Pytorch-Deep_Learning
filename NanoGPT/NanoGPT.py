@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+data_choice = "data/Shakespear.txt" 
+
 # === 1. 超参数设置 ===
 batch_size = 64      # 每次并行处理多少个序列
 block_size = 256     # 句子的最大长度 (Context Window)
@@ -19,7 +21,7 @@ dropout = 0.2        # 防止过拟合的丢弃率：在每一次训练步骤中
 torch.manual_seed(1337) # 设定随机种子，使得程序每次运行时生成的初始随机数都是一样的，使得在不同设备上能得到相同的结果
 
 # === 2. 数据读取与预处理 ===
-with open("NanoGPT\input.txt", 'r', encoding='utf-8') as f:
+with open(data_choice, encoding='utf-8') as f:
     text = f.read()
 
 # set给整篇文章去重，enumerate 给每个字符打上索引
