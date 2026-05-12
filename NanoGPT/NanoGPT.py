@@ -47,6 +47,10 @@ def get_batch(split):
     x, y = x.to(device), y.to(device)   # 如果有GPU, 就把数据从CPU的内存丢到显卡的显存里
     return x, y
 
+# 本质: 
+# model.eval()
+# with torch.no_grad(): ...
+
 @torch.no_grad() # 装饰器的作用：在进入函数前先关闭梯度记录，退出时又重新开启
 def estimate_loss():
     '''评估损失'''
@@ -65,39 +69,56 @@ def estimate_loss():
 # === 3. 模型组件定义 ===
 
 class Head(nn.Module):
+    '''单头注意力'''
     def __init__(self, head_size):
-        super().__init__()
+        super().__init__() # 调用父类初始化，激活Pytorch的管理功能
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
+        # 在nn.Module的__init__中定义线性层时，它们的参数会被注册为Parameters, 意味着优化器在训练时会更新它们
+        # self.register_buffer : 专门存放"非参数，但属于模型一部分"的数据，不会更新，但也会随着模型保存、搬到显卡上
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        # 创建一个具体的层，用来执行丢弃任务
+        # nn.Dropout(dropout_rate)是nn.Module提供的功能层,
+        # 调用model.train()时：nn.Module会通知所有dropout层：开始工作
+        # 调用model.eval()时：会停止丢弃，准备预测。
         self.dropout = nn.Dropout(dropout)
-
+        # 底层逻辑：1. 生成掩码，如对于(1, 1, 1, 1), 丢弃率0.25, 则产生掩码(随机) (0, 1, 1, 1)
+        # 2. 丢弃 ： (1, 1, 1, 1) * (0, 1, 1, 1) = (0, 1, 1, 1)
+        # 3. 缩放(使得模长不变) 所有数值除以(1 - p)
+ 
     def forward(self, x):
-        B, T, C = x.shape
+        B, T, C = x.shape # Batch, Time(Tokens, 有多少单词), Channels(向量维度)
         k = self.key(x)   # (B,T,head_size)
         q = self.query(x) # (B,T,head_size)
-        wei = q @ k.transpose(-2, -1) * C**-0.5
+        wei = q @ k.transpose(-2, -1) * C**-0.5 # k.transpose(-2, -1) : (B, head_size, T), 只转置最后两个维度进行矩阵相乘
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        wei = F.softmax(wei, dim=-1)
-        wei = self.dropout(wei)
+        wei = F.softmax(wei, dim=-1) # wei : (B, T, T)
+        wei = self.dropout(wei)      # 随机丢弃
         v = self.value(x)
-        out = wei @ v
+        out = wei @ v # (B, T, T) * (B, T, head_size) = (B, T, head_size) 
+        
+        # wei (B, T, T)：这是一个权重矩阵。对于 batch 中的每一行，它告诉我们：为了理解当前位置的词，我们需要对句子中其他位置的词付出多少“注意力” 。
+        # v (B, T, head_size)：这是每个词的“特征向量”
+        # 得到的out就是学习了上下文之后，表示了每个词的特征的矩阵
         return out
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        # self.proj : 将多头注意力分别处理数据并拼接得到的矩阵再进行一次处理，从而融合多头的数据特征
         self.proj = nn.Linear(n_embd, n_embd)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        # 拼接 n_embd // head_size 个 (B, T, head_size) 得到 (B, T, n_embd)
+        out = torch.cat([h(x) for h in self.heads], dim=-1) 
         out = self.dropout(self.proj(out))
         return out
 
 class FeedForward(nn.Module):
+    '''前馈网络'''
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
@@ -108,9 +129,11 @@ class FeedForward(nn.Module):
         )
 
     def forward(self, x):
+        '''前向传播'''
         return self.net(x)
 
 class Block(nn.Module):
+    '''Transformer 块'''
     def __init__(self, n_embd, n_head):
         super().__init__()
         head_size = n_embd // n_head
@@ -137,38 +160,46 @@ class NanoGPT(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.blocks = nn.Sequential(*[Block(n_embd=n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd)
+
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-        tok_emb = self.token_embedding_table(idx)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))
-        x = tok_emb + pos_emb
+        tok_emb = self.token_embedding_table(idx) # 拿到(batch_size, tokens, n_embd),即原词表中提取的部分特征向量
+        # torch.arange(T) ：生成一个从 0 到 T-1 的等差数列张量
+        # device = device : 在Pytorch中，两个张量必须处在同一个设备上才能进行运算
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (tokens, n_embd)
+        x = tok_emb + pos_emb # 加上位置张量，给输入增添了位置信息(运算采用广播机制)
         x = self.blocks(x)
         x = self.ln_f(x)
+        # 解码，输出的logits(batch_size, tokens, vocab_size)
+        # 对每一批(batch)的每个词(tokens), 长度为vocab_size 的向量表示词表中"下一个词"出现的概率
         logits = self.lm_head(x)
 
-        if targets is None:
+        if targets is None: # target 标准答案 (B, T)
             loss = None
         else:
             B, T, C = logits.shape
             logits = logits.view(B*T, C)
             targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
+            # F.cross_entropy的输入是二维的：(样本数，类别数)
+            loss = F.cross_entropy(logits, targets) # 计算交叉熵
 
         return logits, loss
 
     def generate(self, idx, max_new_tokens):
+        '''idx : (B, T), B个起始点与其后面的共T个字符'''
         for _ in range(max_new_tokens):
-            idx_cond = idx[:, -block_size:]
+            idx_cond = idx[:, -block_size:] # 只选取最后block_size个词来预测下一个词
+            # 好习惯：self(idx_cond)而不是forward(idx_cond), 虽然是实际上是调用了forward
             logits, loss = self(idx_cond)
-            logits = logits[:, -1, :]
+            logits = logits[:, -1, :] # (B, 1, n_embd)， 取最后一个词的预测结果，也就是预测出来的下一个词的可能性
             probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-        return idx
+            idx_next = torch.multinomial(probs, num_samples=1) # 为每个词根据概率分布抽取下一个词(而不是直接选择概率最高的词)
+            idx = torch.cat((idx, idx_next), dim=1) # 把抽中的新词拼接在旧序列的后面
+        return idx # (B, T + max_new_tokens)， 因为循环了max_new_tokens次，每次拼接一个词
 
 # === 5. 实例化与训练 ===
 
