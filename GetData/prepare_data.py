@@ -31,8 +31,8 @@ n = int(0.9 * len(ids_array))
 train_data = ids_array[:n]
 val_data = ids_array[n:]
 
-train_data.tofile('train.bin')
-val_data.tofile('val.bin')
+train_data.tofile('data/train.bin')
+val_data.tofile('data/val.bin')
 
 # 4. 保存元数据
 with open('meta.pkl', 'wb') as f:

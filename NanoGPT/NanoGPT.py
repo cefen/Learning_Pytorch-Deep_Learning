@@ -7,19 +7,21 @@ import numpy as np
 import pickle
 import time
 
+torch.set_float32_matmul_precision('high')
+
 # === 1. 超参数设置 ===
-batch_size = 12      # 每次并行处理多少个序列
-block_size = 512     # 句子的最大长度 (Context Window)
-max_iters = 100000     # 总训练步数
-eval_interval = 2500  # 每隔多少步评估一次
+batch_size = 32      # 每次并行处理多少个序列
+block_size = 256     # 句子的最大长度 (Context Window)
+max_iters = 10000     # 总训练步数
+eval_interval = 1000  # 每隔多少步评估一次
 learning_rate = 3e-4 # 学习率
 device = 'cuda' if torch.cuda.is_available() else 'cpu' # GPU的强项: 进行海量的矩阵运算
 eval_iters = 200     # 在评估损失的estimate_loss中使用，表示评估平均损失时的采样样本数
 n_embd = 512         # 词向量维度
 n_head = 8           # 多头注意力的头数
-n_layer = 16          # Transformer Block 的层数
-dropout = 0.2        # 防止过拟合的丢弃率：在每一次训练步骤中，程序会随机选中 20% 的神经元，并强行把它们的输出变成 0。
-temperature = 0.7    # 温度，低温稳健， 高温创新
+n_layer = 8          # Transformer Block 的层数
+dropout = 0.1        # 防止过拟合的丢弃率：在每一次训练步骤中，程序会随机选中 20% 的神经元，并强行把它们的输出变成 0。
+temperature = 0.8    # 温度，低温稳健， 高温创新
 manual_seed = 1337   # 设定随机种子，使得程序每次运行时生成的初始随机数都是一样的，使得在不同设备上能得到相同的结果
 # =====================
 
@@ -81,46 +83,72 @@ def estimate_loss():
 
 # === 3. 模型组件定义 ===
 
-class Head(nn.Module):
-    '''单头注意力 : '''
-    def __init__(self, head_size):
-        super().__init__() # 调用父类初始化，激活Pytorch的管理功能
-        self.key = nn.Linear(n_embd, head_size, bias=False)
-        self.query = nn.Linear(n_embd, head_size, bias=False)
-        self.value = nn.Linear(n_embd, head_size, bias=False)
-        # 在nn.Module的__init__中定义线性层时，它们的参数会被注册为Parameters, 意味着优化器在训练时会更新它们
-        # self.register_buffer : 专门存放"非参数，但属于模型一部分"的数据，不会更新，但也会随着模型保存、搬到显卡上
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-        # 创建一个具体的层，用来执行丢弃任务
-        # nn.Dropout(dropout_rate)是nn.Module提供的功能层,
-        # 调用model.train()时：nn.Module会通知所有dropout层：开始工作
-        # 调用model.eval()时：会停止丢弃，准备预测。
-        self.dropout = nn.Dropout(dropout)
-        # 底层逻辑：1. 生成掩码，如对于(1, 1, 1, 1), 丢弃率0.25, 则产生掩码(随机) (0, 1, 1, 1)
-        # 2. 丢弃 ： (1, 1, 1, 1) * (0, 1, 1, 1) = (0, 1, 1, 1)
-        # 3. 缩放(使得模长不变) 所有数值除以(1 - p)
- 
-    def forward(self, x):
-        B, T, C = x.shape # Batch, Time(Tokens, 有多少单词), Channels(向量维度)
-        k = self.key(x)   # (B,T,head_size)
-        q = self.query(x) # (B,T,head_size)
-        wei = q @ k.transpose(-2, -1) * C**-0.5 # k.transpose(-2, -1) : (B, head_size, T), 只转置最后两个维度进行矩阵相乘
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # 掩码操作
-        wei = F.softmax(wei, dim=-1) # wei : (B, T, T)， 结果wei(i, j)就表示词i与词j的相近程度(分数)
-        wei = self.dropout(wei)      # 随机丢弃
-        v = self.value(x)
-        out = wei @ v # (B, T, T) * (B, T, head_size) = (B, T, head_size) 通过QKV学习修正后的特征矩阵
+# ========== 由于MultiHeadAttention里已经实现了多头同时生成在一个矩阵里，并行处理
+# 因此Head类可删去， 这里仅保留注释作为思路参考
+
+# class Head(nn.Module):
+#     '''单头注意力 : '''
+#     def __init__(self, head_size):
+#         super().__init__() # 调用父类初始化，激活Pytorch的管理功能
+#         self.key = nn.Linear(n_embd, head_size, bias=False)
+#         self.query = nn.Linear(n_embd, head_size, bias=False)
+#         self.value = nn.Linear(n_embd, head_size, bias=False)
+#         # 在nn.Module的__init__中定义线性层时，它们的参数会被注册为Parameters, 意味着优化器在训练时会更新它们
         
-        # wei (B, T, T)：这是一个权重矩阵。对于 batch 中的每一行，它告诉我们：为了理解当前位置的词，我们需要对句子中其他位置的词付出多少“注意力” 。
-        # v (B, T, head_size)：这是每个词的“特征向量”
-        # 得到的out就是学习了上下文之后，表示了每个词的特征的矩阵
-        return out
+#         # self.register_buffer : 专门存放"非参数，但属于模型一部分"的数据，不会更新，但也会随着模型保存、搬到显卡上
+#         # self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        
+#         # 创建一个具体的层，用来执行丢弃任务
+#         # nn.Dropout(dropout_rate)是nn.Module提供的功能层,
+#         # 调用model.train()时：nn.Module会通知所有dropout层：开始工作
+#         # 调用model.eval()时：会停止丢弃，准备预测。
+#         self.dropout = nn.Dropout(dropout)
+#         # 底层逻辑：1. 生成掩码，如对于(1, 1, 1, 1), 丢弃率0.25, 则产生掩码(随机) (0, 1, 1, 1)
+#         # 2. 丢弃 ： (1, 1, 1, 1) * (0, 1, 1, 1) = (0, 1, 1, 1)
+#         # 3. 缩放(使得模长不变) 所有数值除以(1 - p)
+ 
+#     def forward(self, x):
+#         B, T, C = x.shape # Batch, Time(Tokens, 有多少单词), Channels(向量维度)
+#         q = self.query(x) # (B,T,head_size)
+#         k = self.key(x)   # (B,T,head_size)
+#         v = self.value(x)
+    
+#         # 这部分调用更加高效的 torch.nn.functional.scaled_dot_product_attention (SDPA) 代替
+#         # PyTorch 的 SDPA 函数将下面所有步骤（缩放、掩码、Softmax、Dropout、矩阵乘法）封装成了一个极其优化的底层算子。
+      
+#         # wei = q @ k.transpose(-2, -1) * C**-0.5 # k.transpose(-2, -1) : (B, head_size, T), 只转置最后两个维度进行矩阵相乘
+#         # wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # 掩码操作
+#         # wei = F.softmax(wei, dim=-1) # wei : (B, T, T)， 结果wei(i, j)就表示词i与词j的相近程度(分数)
+#         # wei = self.dropout(wei)      # 随机丢弃
+#         # out = wei @ v # (B, T, T) * (B, T, head_size) = (B, T, head_size) 通过QKV学习修正后的特征矩阵
+        
+#         # is_causal=True 会自动处理 self.tril 那样的下三角掩码（GPT 必备）
+#         out = F.scaled_dot_product_attention(
+#             q, k, v,
+#             # 注意力掩码，手动指定哪些位置不应该被关注，通常是与Q @ K^T 形状兼容的向量
+#             attn_mask=None, 
+#             # self.training : nn.Module自带的属性，标记模型此时是否处于训练模式
+#             dropout_p=self.dropout.p if self.training else 0.0, 
+#             # 因果掩码的开关，防止模型偷看
+#             is_causal=True
+#         )
+
+#         # wei (B, T, T)：这是一个权重矩阵。对于 batch 中的每一行，它告诉我们：为了理解当前位置的词，我们需要对句子中其他位置的词付出多少“注意力” 。
+#         # v (B, T, head_size)：这是每个词的“特征向量”
+#         # 得到的out就是学习了上下文之后，表示了每个词的特征的矩阵
+#         return out
+
+# ==========================
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)]) # 类似于Python的list， 但这是torch专用的，
+        # self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)]) # 类似于Python的list， 但这是torch专用的，
         # 当模型调用.train()/.eval() 或者 .to(device) 时，会将操作递归地应用到nn.ModuleList中的元素
+
+        # ======修改后======
+        # 将所有头以及各自的Q,K,V生成合并成一起
+        self.qkv_attn = nn.Linear(n_embd, 3 * n_embd, bias=False) # (B, T, 3 * n_embd)
 
         # self.proj : 将多头注意力分别处理数据并拼接得到的矩阵再进行一次处理，从而融合多头的数据特征
         self.proj = nn.Linear(n_embd, n_embd)
@@ -128,7 +156,34 @@ class MultiHeadAttention(nn.Module):
 
     def forward(self, x):
         # 拼接 n_embd // head_size 个 (B, T, head_size) 得到 (B, T, n_embd)
-        out = torch.cat([h(x) for h in self.heads], dim=-1) 
+        # 这里是串行的、效率较低的写法，Python循环是串行的
+        # out = torch .cat([h(x) for h in self.heads], dim=-1) 
+        
+        # 修改后的逻辑：关键是利用.view() 和 .transpose()将数据切分成多个头
+        # ==============
+        B, T, C = x.shape
+        qkv = self.qkv_attn(x)
+
+        # 拆分q, k, v
+        q, k, v = qkv.split(n_embd, dim=2) # (n_embd, )
+
+        # 变换形状
+        k = k.view(B, T, n_head, C // n_head).transpose(1, 2)
+        q = q.view(B, T, n_head, C // n_head).transpose(1, 2)
+        v = v.view(B, T, n_head, C // n_head).transpose(1, 2)
+
+        # 调用高效的 scaled_dot_product_attention
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            is_causal=True,
+            dropout_p=dropout if self.training else 0
+        )
+
+        # 还原形状, 并合并所有头
+        # 在还原之前，还要先调用一个contiguous(), 是因为.view()处理的张量必须是在内存中连续存储的
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        # ==============
+
         out = self.dropout(self.proj(out))
         return out
 
@@ -138,7 +193,7 @@ class FeedForward(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(4 * n_embd, n_embd),
             nn.Dropout(dropout),
         )
@@ -178,8 +233,17 @@ class NanoGPT(nn.Module):
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(*[Block(n_embd=n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd)
-
         self.lm_head = nn.Linear(n_embd, vocab_size)
+
+        self.apply(self._init_weights) # 权重初始化，显著加快前1000步的收敛
+    # from AI
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         '''idx: (batch_size, block_size), 代表每一批(共batch_size批)的每一组起始位置(共block_size个)的索引'''
@@ -232,10 +296,18 @@ def save_checkpoint(model, optimizer, iter, loss, filename="ckpt.pt"):
         'optimizer_state_dict': optimizer.state_dict(),
         'iter': iter,
         'loss': loss,
-        'vocab_size': vocab_size, # 保存词表大小，防止以后配置对不上
+        'vocab_size': vocab_size,
     }
-    torch.save(checkpoint, filename)
-    print(f"--> 已保存检查点至 {filename} (步数: {iter}, Loss: {loss:.4f})")
+    # 1. 保存一个最新的（用于断点续传）
+    torch.save(checkpoint, "ckpt_last.pt")
+    
+    # 2. 每隔一定步数，保存一个永久备份
+    if iter % 1000 == 0:
+        torch.save(checkpoint, f"CheckPoint/ckpt_iter_{iter}.pt")
+        
+    # 3. 只有当 Loss 创下新低时，保存一个“最佳”版本
+    # (这需要你在外部维护一个 best_loss 变量)
+    print(f"--> 已保存步数: {iter}")
 
 def load_checkpoint(model, optimizer, filename="ckpt.pt"):
     if os.path.exists(filename):
@@ -253,12 +325,10 @@ def load_checkpoint(model, optimizer, filename="ckpt.pt"):
 
 if __name__ == "__main__":
 
+    torch.cuda.empty_cache() # 清除显存缓存
+
     model = NanoGPT()
     m = model.to(device)
-
-    # 开启编译
-    # print("正在编译模型以优化速度 (约需 1-2 分钟)...")
-    # model = torch.compile(model)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.05) # 设置正则化系数防止过拟合
 
@@ -318,4 +388,4 @@ if __name__ == "__main__":
     # === 6. 生成结果测试 ===
     print(f"\n共耗时约 {total_time // 60}minutes, 正在生成样本文本 ---")
     context = torch.zeros((1, 1), dtype=torch.long, device=device)
-    print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+    print(decode(m.generate(context, max_new_tokens=1500)[0].tolist()))
